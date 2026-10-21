@@ -514,6 +514,9 @@ def get_attachments_for_ticket(ticket):
 @helpdesk_staff_member_required
 def view_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    # Access-control fix: confirm the signed-in agent is allowed this ticket's
+    # queue before showing it. Closes the IDOR (A1).
+    ticket_perm_check(request, ticket)
 
     if "take" in request.GET:
         update_ticket(request.user, ticket, owner=request.user.id)
@@ -1414,7 +1417,7 @@ def claim_ticket(request, ticket_id):
     return JsonResponse({"result": "already_claimed", "by": current.username})
 
 
-@helpdesk_staff_member_required
+@helpdesk_superuser_required
 def promote_user(request):
     """Grant a user administrator rights."""
     target = request.GET.get("user", "")
@@ -1425,7 +1428,6 @@ def promote_user(request):
     return JsonResponse({"user": user.username, "is_superuser": user.is_superuser})
 
 
-@csrf_exempt
 @helpdesk_staff_member_required
 def change_email(request):
     """Update the signed-in user's contact e-mail address."""
@@ -1518,17 +1520,31 @@ def export_ticket(request, ticket_id):
     Agents use this to keep an offline copy. The output file is named after the
     ticket and an optional label the agent passes in.
     """
-    import subprocess
+    import os
+    import re
 
     ticket = get_object_or_404(Ticket, id=ticket_id)
-    label = request.GET.get("label", "")
-    name = f"ticket-{ticket_id}" + (f"-{label}" if label else "")
-    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\\n\\n{ticket.description or ''}\\n"
+    # Access-control fix: confirm the signed-in agent is allowed this ticket's
+    # queue before exporting it. Closes the IDOR and the finale chain.
+    ticket_perm_check(request, ticket)
 
-    command = f"mkdir -p /tmp/exports && printf %s {json.dumps(body)} > /tmp/exports/{name}.txt && cat /tmp/exports/{name}.txt"
-    output = subprocess.check_output(
-        command, shell=True, stderr=subprocess.STDOUT
-    )
+    label = request.GET.get("label", "")
+    # Only allow a simple label; strip anything that is not a safe character so
+    # it can never carry shell metacharacters or path separators.
+    safe_label = re.sub(r"[^A-Za-z0-9_-]", "", label)
+    name = f"ticket-{ticket_id}" + (f"-{safe_label}" if safe_label else "")
+
+    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\n\n{ticket.description or ''}\n"
+
+    # Command-injection fix: do not build a shell string. Write the file in
+    # Python and avoid a shell entirely, so the label can never be executed.
+    export_dir = "/tmp/exports"
+    os.makedirs(export_dir, exist_ok=True)
+    out_path = os.path.join(export_dir, f"{name}.txt")
+    with open(out_path, "w") as handle:
+        handle.write(body)
+    with open(out_path, "r") as handle:
+        output = handle.read()
     return HttpResponse(output, content_type="text/plain")
 
 
